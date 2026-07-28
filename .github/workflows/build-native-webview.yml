@@ -1,0 +1,50 @@
+# native-webview-workflow-template.yml
+#
+# Workflow ini KHUSUS untuk mode "Native Android" di fitur Web2APK.
+# Bedanya dengan mode Flutter: project ini TIDAK memakai Flutter sama
+# sekali — cuma Kotlin + Android SDK murni. WebView jadi satu-satunya
+# lapisan UI, tanpa Flutter engine di atasnya. Ini yang bikin app hasil
+# mode ini terasa jauh lebih ringan & mulus (setara app web2apk native
+# lain), karena tidak ada overhead "platform view compositing" yang ada
+# di pendekatan Flutter.
+#
+# GitHub Actions runner (ubuntu-latest) sudah termasuk Android SDK +
+# lisensi ter-accept secara default, jadi workflow ini tidak perlu
+# setup Flutter SDK sama sekali — cuma JDK + Gradle.
+
+name: Build Native WebView APK (Wanzz Deploy)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Pastikan Android SDK platform tersedia
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-36" > /dev/null 2>&1 || true
+
+      - name: Build APK (release, signed pakai debug keystore bawaan)
+        run: gradle assembleRelease --no-daemon
+
+      - name: Upload APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
