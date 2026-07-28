@@ -1,0 +1,213 @@
+# web2apk-workflow-template.yml
+#
+# Workflow ini dipakai KHUSUS oleh fitur Web2APK di Wanzz Deploy. Kamu
+# TIDAK PERLU copy file ini manual — Wanzz Deploy otomatis push file ini
+# (plus pubspec.yaml, lib/main.dart, dan assets/icon.png yang sudah
+# di-generate sesuai isian kamu) ke repo baru saat kamu klik tombol
+# "Buat & Build APK" di halaman Web2APK.
+#
+# Cara kerja workflow ini:
+# 1. Checkout repo (isinya pubspec.yaml, lib/main.dart, assets/icon.png
+#    yang sudah disiapkan Wanzz Deploy — main.dart berisi WebView yang
+#    memuat URL website kamu, plus dukungan file picker untuk
+#    <input type="file"> di website).
+# 2. `flutter create --platforms android .` — melengkapi folder
+#    android/ (Gradle, Manifest, dsb) TANPA menimpa pubspec.yaml /
+#    lib/main.dart yang sudah ada (ini perilaku resmi Flutter untuk
+#    menambah platform ke project yang sudah ada).
+# 3. Tambah izin INTERNET + akses file/storage/kamera/media ke
+#    AndroidManifest (wajib supaya WebView bisa akses internet DAN
+#    <input type="file"> di website bisa buka galeri/kamera/storage).
+# 4. Tambah network security config yang MENGIZINKAN trafik HTTP biasa
+#    (cleartext) — wajib kalau website target kamu masih pakai http://
+#    bukan https://, karena Android 9+ MEMBLOKIR http:// secara default
+#    (error "net::ERR_CLEARTEXT_NOT_PERMITTED" kalau ini tidak diatur).
+# 5. flutter pub get, lalu paksa compileSdk Android ke 36 di
+#    android/app/build.gradle(.kts) — dibutuhkan oleh file_picker (lewat
+#    dependency flutter_plugin_android_lifecycle) yang mensyaratkan
+#    compileSdk >= 36, sementara default project bisa lebih rendah dari
+#    itu (kalau tidak diatur, build gagal dengan error
+#    "checkReleaseAarMetadata").
+# 6. flutter_launcher_icons menerapkan assets/icon.png sebagai ikon
+#    aplikasi ke semua resolusi Android.
+# 7. Build APK release, upload sebagai artifact.
+
+name: Build Web2APK (Wanzz Deploy)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kode
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter (stable channel terbaru)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Lengkapi folder platform Android
+        run: flutter create --platforms android .
+
+      - name: Izinkan HTTP + izin file/media/kamera di AndroidManifest
+        run: |
+          python3 - <<'PYEOF'
+          import re
+          import os
+
+          manifest_path = "android/app/src/main/AndroidManifest.xml"
+          with open(manifest_path, "r") as f:
+              content = f.read()
+
+          # 1. izin-izin yang dibutuhkan: internet + akses file/media/kamera
+          #    (supaya <input type="file"> di website bisa buka file
+          #    picker/galeri/kamera dari dalam WebView)
+          required_permissions = [
+              "android.permission.INTERNET",
+              "android.permission.READ_EXTERNAL_STORAGE",
+              "android.permission.WRITE_EXTERNAL_STORAGE",
+              "android.permission.CAMERA",
+              "android.permission.READ_MEDIA_IMAGES",
+              "android.permission.READ_MEDIA_VIDEO",
+              "android.permission.READ_MEDIA_AUDIO",
+          ]
+          missing = [p for p in required_permissions if p not in content]
+          if missing:
+              lines = "".join(f'    <uses-permission android:name="{p}"/>\n' for p in missing)
+              content = re.sub(
+                  r"(<manifest[^>]*>)",
+                  r"\1\n" + lines.rstrip("\n"),
+                  content,
+                  count=1,
+              )
+              print(f"Izin ditambahkan: {', '.join(missing)}")
+          else:
+              print("Semua izin sudah ada.")
+
+          # 2. buat network_security_config.xml yang mengizinkan HTTP (cleartext)
+          xml_dir = "android/app/src/main/res/xml"
+          os.makedirs(xml_dir, exist_ok=True)
+          config_path = os.path.join(xml_dir, "network_security_config.xml")
+          with open(config_path, "w") as f:
+              f.write(
+                  '<?xml version="1.0" encoding="utf-8"?>\n'
+                  "<network-security-config>\n"
+                  '    <base-config cleartextTrafficPermitted="true">\n'
+                  "        <trust-anchors>\n"
+                  '            <certificates src="system"/>\n'
+                  "        </trust-anchors>\n"
+                  "    </base-config>\n"
+                  "</network-security-config>\n"
+              )
+          print("network_security_config.xml dibuat (mengizinkan HTTP).")
+
+          # 3. arahkan <application> ke network security config + izinkan
+          #    cleartext + pastikan hardware acceleration nyala (perlu buat
+          #    rendering platform view/WebView yang lebih mulus)
+          def patch_application_tag(m):
+              tag = m.group(0)
+              if "android:networkSecurityConfig" not in tag:
+                  tag = tag.replace(
+                      "<application",
+                      '<application android:networkSecurityConfig="@xml/network_security_config"',
+                      1,
+                  )
+              if "android:usesCleartextTraffic" not in tag:
+                  tag = tag.replace(
+                      "<application",
+                      '<application android:usesCleartextTraffic="true"',
+                      1,
+                  )
+              if "android:hardwareAccelerated" not in tag:
+                  tag = tag.replace(
+                      "<application",
+                      '<application android:hardwareAccelerated="true"',
+                      1,
+                  )
+              return tag
+
+          content = re.sub(r"<application\b[^>]*>", patch_application_tag, content, count=1)
+
+          # 4. aktifkan Impeller (renderer Flutter terbaru) — didesain khusus
+          #    untuk memperbaiki performa platform view seperti WebView,
+          #    dibanding renderer Skia lama yang sering terasa nge-lag saat
+          #    scroll di dalam WebView. Ditambahkan sebagai <meta-data> di
+          #    dalam <application>, bukan atribut.
+          if "EnableImpeller" not in content:
+              impeller_meta = (
+                  '    <meta-data\n'
+                  '        android:name="io.flutter.embedding.android.EnableImpeller"\n'
+                  '        android:value="true" />\n'
+              )
+              content = re.sub(
+                  r"(<application\b[^>]*>)",
+                  r"\1\n" + impeller_meta.rstrip("\n"),
+                  content,
+                  count=1,
+              )
+              print("Impeller renderer diaktifkan (untuk performa WebView lebih baik).")
+
+          with open(manifest_path, "w") as f:
+              f.write(content)
+          print("AndroidManifest.xml sudah diatur untuk mengizinkan HTTP & performa lebih baik.")
+          PYEOF
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Naikkan compileSdk ke 36 (dibutuhkan file_picker)
+        run: |
+          python3 - <<'PYEOF'
+          import re
+          import os
+
+          # file_picker (lewat flutter_plugin_android_lifecycle) butuh
+          # compileSdk Android minimal 36. Project default dari
+          # `flutter create` biasanya masih memakai versi default Flutter
+          # SDK yang bisa lebih rendah dari itu, jadi kita paksa ke 36 di
+          # sini supaya build tidak gagal dengan error
+          # "checkReleaseAarMetadata" / "compile against version 36".
+          candidates = [
+              "android/app/build.gradle.kts",
+              "android/app/build.gradle",
+          ]
+          target = next((p for p in candidates if os.path.exists(p)), None)
+
+          if target is None:
+              print("Tidak menemukan android/app/build.gradle(.kts), lewati step ini.")
+          else:
+              with open(target, "r") as f:
+                  content = f.read()
+
+              # cocok untuk Groovy ("compileSdkVersion flutter.compileSdkVersion",
+              # "compileSdk flutter.compileSdkVersion") maupun Kotlin DSL
+              # ("compileSdk = flutter.compileSdkVersion") — ganti nilainya
+              # jadi literal 36, apa pun gaya penulisannya.
+              new_content, count = re.subn(
+                  r"(compileSdk(?:Version)?\s*=?\s*)flutter\.compileSdkVersion",
+                  r"\g<1>36",
+                  content,
+              )
+
+              if count > 0:
+                  with open(target, "w") as f:
+                      f.write(new_content)
+                  print(f"compileSdk di {target} dinaikkan ke 36 ({count} baris diubah).")
+              else:
+                  print(f"Pola compileSdk tidak ditemukan di {target}, tidak ada perubahan.")
+          PYEOF
+
+      - name: Terapkan ikon custom
+        run: flutter pub run flutter_launcher_icons
+
+      - name: Build APK (release)
+        run: flutter build apk --release
+
+      - name: Upload APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
